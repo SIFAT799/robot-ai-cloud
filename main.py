@@ -31,6 +31,7 @@ OPENROUTER_MODEL = os.getenv(
 # Streaming options (all optional)
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "groq" if GROQ_API_KEY else "openrouter").lower()   # groq (fast) | openrouter
 GROQ_LLM_MODEL = os.getenv("GROQ_LLM_MODEL", "llama-3.1-8b-instant")      # 8b = fastest first token; set llama-3.3-70b-versatile for a smarter (slower) brain
+GROQ_FALLBACK_MODEL = os.getenv("GROQ_FALLBACK_MODEL", "llama-3.3-70b-versatile")
 ELEVENLABS_MODEL = os.getenv("ELEVENLABS_MODEL", "eleven_flash_v2_5")   # fast; set eleven_multilingual_v2 to go back
 STT_LANGUAGE = os.getenv("STT_LANGUAGE", "en")                          # "" = let Whisper guess (it invents greetings in other languages from noise)
 NO_SPEECH_MAX = float(os.getenv("NO_SPEECH_MAX", "0.6"))                # Whisper: segment is "probably not speech" above this ...
@@ -807,33 +808,42 @@ async def llm_stream(user_text: str, context: str = ""):
     """Yield text pieces of the chat answer while the model is still writing."""
     url, key, model = llm_target()
 
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": CHAT_SYSTEM_PROMPT + (context or "")},
-            {"role": "user", "content": user_text},
-        ],
-        "temperature": 0.7,
-        "max_tokens": 120,
-        "stream": True,
-    }
     headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
-    async with http_client().stream("POST", url, headers=headers, json=payload) as r:
-        if r.status_code != 200:
-            body = (await r.aread()).decode("utf-8", "ignore")[:300]
-            raise RuntimeError(f"LLM error {r.status_code}: {body}")
-        async for line in r.aiter_lines():
-            if not line.startswith("data:"):
+    models = [model]
+    if LLM_PROVIDER == "groq" and model != GROQ_FALLBACK_MODEL:
+        models.append(GROQ_FALLBACK_MODEL)          # the fast model is unavailable -> use the bigger one
+    last_err = ""
+    for m in models:
+        payload = {
+            "model": m,
+            "messages": [
+                {"role": "system", "content": CHAT_SYSTEM_PROMPT + (context or "")},
+                {"role": "user", "content": user_text},
+            ],
+            "temperature": 0.7,
+            "max_tokens": 120,
+            "stream": True,
+        }
+        async with http_client().stream("POST", url, headers=headers, json=payload) as r:
+            if r.status_code != 200:
+                body = (await r.aread()).decode("utf-8", "ignore")[:300]
+                last_err = f"LLM error {r.status_code} ({m}): {body}"
+                print(f"[LLM] {last_err}")
                 continue
-            data = line[5:].strip()
-            if data == "[DONE]":
-                break
-            try:
-                delta = json.loads(data)["choices"][0]["delta"].get("content")
-            except (ValueError, KeyError, IndexError, TypeError):
-                continue
-            if delta:
-                yield delta
+            async for line in r.aiter_lines():
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    delta = json.loads(data)["choices"][0]["delta"].get("content")
+                except (ValueError, KeyError, IndexError, TypeError):
+                    continue
+                if delta:
+                    yield delta
+            return
+    raise RuntimeError(last_err or "LLM failed")
 
 
 async def tts_stream(text: str):
