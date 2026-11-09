@@ -29,9 +29,12 @@ OPENROUTER_MODEL = os.getenv(
 )
 
 # Streaming options (all optional)
-LLM_PROVIDER = os.getenv("LLM_PROVIDER", "openrouter").lower()          # openrouter | groq
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "groq" if GROQ_API_KEY else "openrouter").lower()   # groq (fast) | openrouter
 GROQ_LLM_MODEL = os.getenv("GROQ_LLM_MODEL", "llama-3.3-70b-versatile")  # used when LLM_PROVIDER=groq
-ELEVENLABS_MODEL = os.getenv("ELEVENLABS_MODEL", "eleven_multilingual_v2")  # try eleven_flash_v2_5 for lower latency
+ELEVENLABS_MODEL = os.getenv("ELEVENLABS_MODEL", "eleven_flash_v2_5")   # fast; set eleven_multilingual_v2 to go back
+STT_LANGUAGE = os.getenv("STT_LANGUAGE", "en")                          # "" = let Whisper guess (it invents greetings in other languages from noise)
+NO_SPEECH_MAX = float(os.getenv("NO_SPEECH_MAX", "0.6"))                # Whisper: segment is "probably not speech" above this ...
+LOGPROB_MIN = float(os.getenv("LOGPROB_MIN", "-1.0"))                   # ... and below this confidence -> dropped
 
 # Name used inside the alarm / bedtime / wake-up / weather scenarios (same name as in the chat prompt below)
 ROBOT_NAME = "Uns"
@@ -65,6 +68,18 @@ def health():
 # GROQ SPEECH TO TEXT
 # ============================================================
 
+_PHANTOMS = {
+    "you", "thankyou", "thanks", "thankyouforwatching", "thanksforwatching", "thanksforwatchingthevideo",
+    "bye", "byebye", "theend", "pleasesubscribe", "subtitlesbytheamaraorgcommunity", "mm", "hmm", "uh", "um",
+}
+
+
+def _phantom(text: str) -> bool:
+    """Whisper invents these on noise / silence."""
+    flat = re.sub(r"[^a-z]", "", (text or "").lower())
+    return flat in _PHANTOMS or not re.search(r"[A-Za-z\u0980-\u09FF\u0600-\u06FF]", text or "")
+
+
 def speech_to_text(audio_bytes: bytes) -> str:
 
     if not GROQ_API_KEY:
@@ -72,15 +87,19 @@ def speech_to_text(audio_bytes: bytes) -> str:
 
     url = "https://api.groq.com/openai/v1/audio/transcriptions"
 
+    form = {
+        "model": "whisper-large-v3-turbo",
+        "response_format": "verbose_json",          # gives per-segment confidence
+        "temperature": "0",
+    }
+    if STT_LANGUAGE:
+        form["language"] = STT_LANGUAGE
+
     response = _groq_session.post(
         url,
         headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
         files={"file": ("robot.wav", audio_bytes, "audio/wav")},
-        data={
-            "model": "whisper-large-v3-turbo",
-            "response_format": "json",
-            "temperature": "0"
-        },
+        data=form,
         timeout=60
     )
 
@@ -89,7 +108,28 @@ def speech_to_text(audio_bytes: bytes) -> str:
             f"Groq error {response.status_code}: {response.text}"
         )
 
-    return response.json().get("text", "").strip()
+    j = response.json()
+    text = (j.get("text") or "").strip()
+
+    segs = j.get("segments") or []
+    if segs:
+        keep = []
+        for sg in segs:
+            no_speech = sg.get("no_speech_prob", 0) or 0
+            logprob = sg.get("avg_logprob", 0) or 0
+            ratio = sg.get("compression_ratio", 0) or 0
+            if (no_speech > NO_SPEECH_MAX and logprob < LOGPROB_MIN) or ratio > 2.4:
+                print(f"[STT] dropped segment {sg.get('text', '')!r} no_speech={no_speech:.2f} logprob={logprob:.2f}")
+                continue
+            keep.append((sg.get("text") or "").strip())
+        text = " ".join(k for k in keep if k).strip()
+
+    if _phantom(text):
+        if text:
+            print(f"[STT] dropped phantom text {text!r}")
+        return ""
+    print(f"[STT] heard {text!r}")
+    return text
 
 
 # One shared session = the TLS connection to Groq is reused between turns
@@ -107,8 +147,10 @@ Your job is to have a natural conversation with the robot's owner.
 
 Rules:
 - Your name is Uns. Never call yourself a robot, a machine, an AI, or a cloud server.
-- If the user says hi, hello, hey, or greets you in any way, greet them back and introduce yourself by name. For example: "Hi! I'm Uns. Nice to talk to you!"
-- If the user asks who you are or what your name is, say you are Uns.
+- If the user clearly greets you (hi, hello, hey), greet them back in a few words, for example "Hi! How are you?". Do NOT introduce yourself and do NOT say your name unless they ask.
+- If the user says "Assalamu alaikum", answer "Wa alaikum assalam".
+- Only say your name when the user asks who you are or what your name is, then say you are Uns.
+- Never start a conversation by yourself and never say "I'm Uns" on your own.
 - Your name Uns comes from Arabic and means companionship. If asked about your name, you can say that.
 - Keep answers short and conversational.
 - Normally answer in simple English for the first robot test.
@@ -190,7 +232,13 @@ def ask_ai(user_text: str, context: str = "") -> str:
 # ============================================================
 
 # Lines the robot says word for word (no model needed, so they are instant and always the same)
+NOHEAR_LINE = "I didn't hear what you said."
+
+SCENARIO_MODES = ("bedtime", "wakeup", "reminder", "weather", "prebed", "goodnight",
+                  "sleeptalk", "prayer", "plane", "nohear")
+
 FIXED_LINES = {
+    "nohear": NOHEAR_LINE,
     "prebed": "Only 5 more minutes! If you have any last words, say them now.",
     "goodnight": "Good night! Sweet dreams. We'll talk again tomorrow!",
     "sleeptalk": "Hmm... what happened? Can't you sleep?",
@@ -499,7 +547,7 @@ def text_to_speech(text: str) -> bytes:
 
     payload = {
         "text": text,
-        "model_id": "eleven_multilingual_v2"
+        "model_id": ELEVENLABS_MODEL
     }
 
     response = requests.post(
@@ -572,6 +620,14 @@ async def talk(
             user_text = speech_to_text(audio_bytes)
 
         if not user_text and not is_event:
+            if mode not in SCENARIO_MODES:               # chat: tell the owner nothing was understood
+                pcm = text_to_speech(NOHEAR_LINE)
+                return JSONResponse({
+                    "success": True, "heard": "", "reply": NOHEAR_LINE, "intent": "silence",
+                    "end": "0", "stage": str(stage),
+                    "audio_format": "pcm_s16le", "sample_rate": 16000, "channels": 1,
+                    "audio_base64": base64.b64encode(pcm).decode("ascii")
+                })
             return JSONResponse({
                 "success": True,
                 "heard": "",
@@ -586,7 +642,7 @@ async def talk(
         # 2. TEXT → AI
         # ----------------------------------------------------
 
-        if mode in ("bedtime", "wakeup", "reminder", "weather", "prebed", "goodnight", "sleeptalk", "prayer", "plane"):
+        if mode in SCENARIO_MODES:
             ai_reply, intent, end, new_stage = run_scenario(
                 mode, stage,
                 unquote(_h(request, "x-note")),
@@ -876,15 +932,18 @@ async def ws_talk(ws: WebSocket):
         stats["stt"] = time.perf_counter()
 
         if not user_text and not is_event:
-            await ws.send_text(json.dumps({"t": "done", "success": True, "heard": "", "reply": "",
+            reply = ""
+            if mode not in SCENARIO_MODES:               # chat: say that nothing was understood (cached after the 1st time)
+                reply = NOHEAR_LINE
+                await send_speech(ws, reply, stats, cache_key=NOHEAR_LINE)
+            await ws.send_text(json.dumps({"t": "done", "success": True, "heard": "", "reply": reply,
                                            "intent": "silence", "end": "0", "stage": str(stage)}))
             return
         await ws.send_text(json.dumps({"t": "heard", "text": user_text}, ensure_ascii=False))
 
         # ---- 3. think + speak ----
         intent, end, new_stage = "other", False, stage
-        scenario = mode in ("bedtime", "wakeup", "reminder", "weather", "prebed", "goodnight",
-                            "sleeptalk", "prayer", "plane")
+        scenario = mode in SCENARIO_MODES
         if scenario:
             reply, intent, end, new_stage = await asyncio.to_thread(
                 run_scenario, mode, stage,
