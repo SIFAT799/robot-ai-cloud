@@ -30,7 +30,7 @@ OPENROUTER_MODEL = os.getenv(
 
 # Streaming options (all optional)
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "groq" if GROQ_API_KEY else "openrouter").lower()   # groq (fast) | openrouter
-GROQ_LLM_MODEL = os.getenv("GROQ_LLM_MODEL", "llama-3.3-70b-versatile")  # used when LLM_PROVIDER=groq
+GROQ_LLM_MODEL = os.getenv("GROQ_LLM_MODEL", "llama-3.1-8b-instant")      # 8b = fastest first token; set llama-3.3-70b-versatile for a smarter (slower) brain
 ELEVENLABS_MODEL = os.getenv("ELEVENLABS_MODEL", "eleven_flash_v2_5")   # fast; set eleven_multilingual_v2 to go back
 STT_LANGUAGE = os.getenv("STT_LANGUAGE", "en")                          # "" = let Whisper guess (it invents greetings in other languages from noise)
 NO_SPEECH_MAX = float(os.getenv("NO_SPEECH_MAX", "0.6"))                # Whisper: segment is "probably not speech" above this ...
@@ -137,6 +137,21 @@ _groq_session = requests.Session()
 
 
 # ============================================================
+# LLM (one place that decides Groq or OpenRouter)
+# ============================================================
+
+def llm_target():
+    """(url, api_key, model) for the fast chat model."""
+    if LLM_PROVIDER == "groq":
+        if not GROQ_API_KEY:
+            raise RuntimeError("GROQ_API_KEY is missing")
+        return ("https://api.groq.com/openai/v1/chat/completions", GROQ_API_KEY, GROQ_LLM_MODEL)
+    if not OPENROUTER_API_KEY:
+        raise RuntimeError("OPENROUTER_API_KEY is missing")
+    return ("https://openrouter.ai/api/v1/chat/completions", OPENROUTER_API_KEY, OPENROUTER_MODEL)
+
+
+# ============================================================
 # OPENROUTER AI
 # ============================================================
 
@@ -163,13 +178,10 @@ Rules:
 
 def ask_ai(user_text: str, context: str = "") -> str:
 
-    if not OPENROUTER_API_KEY:
-        raise RuntimeError("OPENROUTER_API_KEY is missing")
-
-    url = "https://openrouter.ai/api/v1/chat/completions"
+    url, key, model = llm_target()
 
     headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Authorization": f"Bearer {key}",
         "Content-Type": "application/json"
     }
 
@@ -179,7 +191,7 @@ def ask_ai(user_text: str, context: str = "") -> str:
         system_prompt += context
 
     payload = {
-        "model": OPENROUTER_MODEL,
+        "model": model,
         "messages": [
             {
                 "role": "system",
@@ -452,13 +464,12 @@ def fallback_intent(user_text):
 
 
 def ask_ai_json(system_prompt, user_text):
-    if not OPENROUTER_API_KEY:
-        raise RuntimeError("OPENROUTER_API_KEY is missing")
+    url, key, model = llm_target()
     response = requests.post(
-        "https://openrouter.ai/api/v1/chat/completions",
-        headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"},
+        url,
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
         json={
-            "model": OPENROUTER_MODEL,
+            "model": model,
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_text or "(no speech - produce your own line now)"},
@@ -767,6 +778,26 @@ def split_sentences(buf: str, final: bool):
     return out, buf
 
 
+def take_first_clause(buf: str, min_comma: int = 10, min_space: int = 28):
+    """Start speaking as early as possible: hand back a short leading clause.
+    Returns (clause, rest); ("", buf) when there is nothing worth speaking yet."""
+    cut = -1
+    for i, ch in enumerate(buf[:-1]):
+        if ch in ",;:\u060c" and buf[i + 1] == " ":
+            if i >= min_comma:
+                cut = i + 1                               # break after the comma
+                break
+        elif ch == " " and i >= min_space:
+            cut = i                                       # no comma for a while: break at a word
+            break
+    if cut < 0:
+        return "", buf
+    head, rest = buf[:cut].strip(), buf[cut:].lstrip()
+    if len(head) < 8:
+        return "", buf
+    return head, rest
+
+
 def clean_for_tts(text: str) -> str:
     text = re.sub(r"[*_`#>~]+", "", text or "")
     return re.sub(r"\s+", " ", text).strip()
@@ -774,14 +805,7 @@ def clean_for_tts(text: str) -> str:
 
 async def llm_stream(user_text: str, context: str = ""):
     """Yield text pieces of the chat answer while the model is still writing."""
-    if LLM_PROVIDER == "groq":
-        if not GROQ_API_KEY:
-            raise RuntimeError("GROQ_API_KEY is missing")
-        url, key, model = "https://api.groq.com/openai/v1/chat/completions", GROQ_API_KEY, GROQ_LLM_MODEL
-    else:
-        if not OPENROUTER_API_KEY:
-            raise RuntimeError("OPENROUTER_API_KEY is missing")
-        url, key, model = "https://openrouter.ai/api/v1/chat/completions", OPENROUTER_API_KEY, OPENROUTER_MODEL
+    url, key, model = llm_target()
 
     payload = {
         "model": model,
@@ -865,11 +889,17 @@ async def chat_stream(ws: WebSocket, user_text: str, context: str, stats: dict) 
 
     async def producer():
         buf = ""
+        first = True
         try:
             async for piece in llm_stream(user_text, context):
                 if "first_token" not in stats:
                     stats["first_token"] = time.perf_counter()
                 buf += piece
+                if first:                                  # speak the opening clause at once
+                    head, buf = take_first_clause(buf)
+                    if head:
+                        first = False
+                        await q.put(head)
                 sents, buf = split_sentences(buf, False)
                 for s in sents:
                     await q.put(s)
@@ -910,7 +940,11 @@ async def ws_talk(ws: WebSocket):
         # ---- 1. receive the recording ----
         audio = bytearray()
         while True:
-            msg = await asyncio.wait_for(ws.receive(), timeout=40)
+            try:
+                msg = await asyncio.wait_for(ws.receive(), timeout=40)
+            except asyncio.TimeoutError:
+                print("[WS] idle timeout, closing")
+                return
             if msg["type"] == "websocket.disconnect":
                 return
             if msg.get("bytes") is not None:
@@ -937,9 +971,10 @@ async def ws_talk(ws: WebSocket):
                 reply = NOHEAR_LINE
                 await send_speech(ws, reply, stats, cache_key=NOHEAR_LINE)
             await ws.send_text(json.dumps({"t": "done", "success": True, "heard": "", "reply": reply,
-                                           "intent": "silence", "end": "0", "stage": str(stage)}))
+                                           "intent": "silence", "end": "0", "stage": str(stage)},
+                                          ensure_ascii=False, separators=(",", ":")))
             return
-        await ws.send_text(json.dumps({"t": "heard", "text": user_text}, ensure_ascii=False))
+        await ws.send_text(json.dumps({"t": "heard", "text": user_text}, ensure_ascii=False, separators=(",", ":")))
 
         # ---- 3. think + speak ----
         intent, end, new_stage = "other", False, stage
@@ -962,20 +997,21 @@ async def ws_talk(ws: WebSocket):
         await ws.send_text(json.dumps({
             "t": "done", "success": True, "heard": user_text, "reply": reply,
             "intent": intent, "end": "1" if end else "0", "stage": str(new_stage),
-        }, ensure_ascii=False))
+        }, ensure_ascii=False, separators=(",", ":")))
 
         t1 = time.perf_counter()
         fa = stats.get("first_audio")
         print(f"[WS] mode={mode} stt={1000*(stats['stt']-t0):.0f}ms "
               f"llm_first={1000*(stats.get('first_token', t1)-stats['stt']):.0f}ms "
               f"first_audio={(1000*(fa-t0)) if fa else -1:.0f}ms total={1000*(t1-t0):.0f}ms")
+        stats["first_audio"] = t1                      # reset for the next turn on a reused socket
 
     except WebSocketDisconnect:
         return
     except Exception as e:
         print(f"[WS] error: {e}")
         try:
-            await ws.send_text(json.dumps({"t": "error", "msg": str(e)[:300]}))
+            await ws.send_text(json.dumps({"t": "error", "msg": str(e)[:300]}, separators=(",", ":")))
         except Exception:
             pass
     finally:
